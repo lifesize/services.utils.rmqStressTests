@@ -1,0 +1,4 @@
+aiofiles~=0.4.0
+aio-pika~=6.6.0
+asynqp~=0.6
+aiormq<4,>=3.2.0
