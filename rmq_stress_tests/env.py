@@ -122,14 +122,15 @@ class RabbitMQNodeContainer:
             config=container_conf,
             name=self.name
         )
+        await self._container.start()
+
         self._container_tasks |= {
             asyncio.create_task(self.process_stats()),
             asyncio.create_task(self.process_stdout()),
             asyncio.create_task(self.process_stderr())
         }
 
-        await self._container.start()
-        await self._container.show()
+        await self._container.show()  # So we have up-to-date net knowledge
         amqp_port_publications = await self._container.port('5672/tcp')
         self.amqp_port = int(amqp_port_publications[0]['HostPort'])
 
@@ -139,13 +140,17 @@ class RabbitMQNodeContainer:
                 timeout=60.0
             )
         except asyncio.TimeoutError:
-            raise Exception(f"Container for {self.name} hasn't started within a minute.")
+            raise Exception(
+                f"Container for {self.name} hasn't started within a minute."
+            )
         if self._starting_errors:
             raise Exception(*self._starting_errors)
 
     async def close(self):
+        print(f'Terminating node {self.name}…')
         await self._container.stop()
         await self._container.delete()
+        print(f'Terminated node {self.name}.')
         _done_tasks, pending_container_tasks = await asyncio.wait(
             self._container_tasks,
             timeout=10.0
@@ -174,6 +179,7 @@ class RMQCluster:
         )
         self.image = f'rabbitmq:{version}-management'
 
+        self.pending_nodes = set()
         self.nodes = []
         self.ports = []
 
@@ -210,11 +216,18 @@ class RMQCluster:
         await self.start_nodes()
 
     async def close(self):
-        nodes = self.nodes[:]
+        nodes_to_close = self.nodes[:]
+        nodes_to_close.extend(self.pending_nodes)
+
+        self.pending_nodes.clear()
         self.nodes.clear()
-        await asyncio.gather(*[node.close() for node in nodes])
+
+        await asyncio.gather(
+            *[node.close() for node in nodes_to_close]
+        )
         if self.network:
             await self.network.delete()
+            print(f'Deleted cluster network {self.network_name}')
 
     async def start_network(self):
         self.network = await self.docker.networks.create(
@@ -227,25 +240,30 @@ class RMQCluster:
             f'{self.name}-rmq{i}'
             for i in range(1, self.size + 1)
         ]
-        config_file = await self.exit_stack.enter_async_context(
-            config_for_rmq_cluster(self.image, node_names)
-        )
 
         for node_index, node_name in zip(
             range(1, self.size + 1),
             node_names
         ):
+            # It would be better to re-use the same config file for all nodes
+            # but Docker for Mac bind mounts are buggy when bound to more than
+            # one container.
+            config_file = await self.exit_stack.enter_async_context(
+                config_for_rmq_cluster(self.image, node_names)
+            )
             node = RabbitMQNodeContainer(
                 self,
                 name=node_name,
                 host_name=node_name,
                 conf_path=config_file.name if config_file else None
             )
+            self.pending_nodes.add(node)
 
             print(f'Starting node {node.name}…')
             await node.start()
             print(f'Started node {node.name}.')
 
+            self.pending_nodes.remove(node)
             self.nodes.append(node)
 
     def random_amqp_port(self):
@@ -292,13 +310,18 @@ async def config_for_rmq_cluster(image, host_names):
                 f'cluster_formation.classic_config.nodes.{i} = rabbit@{host}\n'
             )
         conf_file.flush()
+        print(f'Created temporary cluster node conf file {conf_file.name}.')
+
+        # Docker for Mac does some weird things if the host does anything to
+        # the file following bind-mount.
+        conf_file.file.close()
+
         try:
             yield conf_file
-        except Exception as e:
-            print(e)
-            raise
         finally:
-            print(f'Deleting temporary cluster conf file {conf_file.name}')
+            print(
+                f'Deleting temporary cluster node conf file {conf_file.name}'
+            )
 
 
 @asynccontextmanager
